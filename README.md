@@ -10,12 +10,16 @@ status.
 Sessions (parents, children, siblings) can coordinate directly instead of
 routing everything through the human's composer.
 
+This fork adds a synthetic-message `description` (`Message from <sender session title>`,
+falling back to its session ID) for clients such as OpenChamber. The message body,
+sender metadata, and delivery modes are unchanged.
+
 ## Install
 
 Install from GitHub (this package is **not** published to npm):
 
 ```sh
-opencode plugin add github:jabr/opencode-team-plugin
+opencode plugin add github:ekisu/opencode-team-plugin
 ```
 
 Or reference it directly in `opencode.json` — as a Git package spec or a local
@@ -24,7 +28,7 @@ path:
 ```jsonc
 {
   "plugins": [
-    "github:jabr/opencode-team-plugin",
+    "github:ekisu/opencode-team-plugin",
     // or: "../libs/opencode-team-plugin"
   ]
 }

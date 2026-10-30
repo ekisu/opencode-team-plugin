@@ -240,6 +240,7 @@ export default Plugin.define({
               // The wire format delivers this as a plain user turn, so
               // provenance must ride IN the text (see the context hook below).
               text: `[agent-message from ${context.sessionID}]\n${text}`,
+              description: `Message from ${self.title || context.sessionID}`,
               delivery: mode === "steer" ? "steer" : "queue",
               // Park admits durably without scheduling a run.
               resume: mode === "park" ? false : undefined,
