@@ -50,14 +50,16 @@ delivered to the target model as durable input.
 | `siblings` | all other children of this session's parent |
 | `children` | all children of this session (the parent broadcast) |
 
-**Delivery modes** (`mode`) — an escalation ladder, from "act on this" to
-"just remember this":
+**Delivery modes** (`mode`):
 
-- **`queue`** (default) — queued for after the target finishes its current turn,
-  waking idle sessions. Use for anything the target should act on next.
-- **`steer`** — injected at the target's next model call without stopping
-  execution. Use for mid-run course corrections that shouldn't discard
-  in-flight work.
+- **`steer`** (default) — injected at the target's next model call (its next
+  step boundary) without stopping execution; idle sessions are woken. Several
+  pending steers arrive together, so a correction sent right after an order
+  lands in the same step. Use for anything the target should act on.
+- **`queue`** — delivered only after the target finishes its current turn.
+  A busy target can take minutes to get there, and several queued messages
+  arrive one per turn, so use it only when the message must not reach the
+  target mid-turn.
 - **`interrupt`** — aborts the target's current execution entirely, then
   delivers; the message starts a fresh run. Use when its current work is wrong
   or obsolete ("stop what you're doing").
@@ -65,8 +67,18 @@ delivered to the target model as durable input.
   delivered only if the target runs again later. Use for FYI context,
   findings, or notes the target should see IF it resumes — never for action
   items.
+- **`note`** — delivers nothing. Stores the sender's latest one-line progress
+  note for its parent (`to: "parent"` only), replacing the previous one; the
+  parent sees it in `team_query` `status`/`list` and nobody is woken. At most
+  one note every 10 s per session; a faster one is refused, not queued.
 
 Sending to your own session is refused.
+
+Progress notes live in the plugin's storage (OpenCode's `kv` table), one key
+per child under its parent (`note/<parentID>/<childID>`), so a parent's notes
+are one prefix scan and siblings never overwrite each other. Session metadata
+is deliberately not used: `session.update` replaces the whole metadata object,
+which hosts such as OpenChamber also write.
 
 ### `team_query`
 
@@ -76,12 +88,14 @@ Inspect, search, and monitor sibling/child sessions. Actions:
   `inboxID` cancels one, `"all"` cancels every pending item.
 - **list** — find sessions: `parent: "my"` (default — this session's
   children), `parent: "parent"` (siblings), `parent: "all"` (recent sessions),
-  or a session ID; `search` filters by title.
+  or a session ID; `search` filters by title. Each row carries the session's
+  latest progress `note` (or `null`) and `noteAge` in seconds.
 - **read** — tail a session's messages (compact summaries, oldest-first);
   `cursor` pages further back using the response's `next`.
 - **status** — whether a session is running or blocked (`"permission"` /
-  `"form"` ask pending — busy but cannot progress); omit `sessionID` for
-  every running session in the scoped project.
+  `"form"` ask pending — busy but cannot progress), plus its latest progress
+  `note` and `noteAge`; omit `sessionID` for every running session in the
+  scoped project.
 - **wait** — block until the given session goes idle, bounded by `timeout`
   seconds (default 300).
 
@@ -96,12 +110,30 @@ provenance rides **in the text**: every message is framed as
 <message>
 ```
 
-A context hook teaches every agent what the frame means: a user turn starting
-`[agent-message from ses_…]` is a durable message from another AI agent
-session, **not** the human user. Treat the sender as a coordinating peer:
-honor its requests at natural boundaries and reply with `team_send` addressed
-to the sender's session ID (also carried in the message metadata as `from`,
-so a reply needs no discovery).
+Every session gets the protocol as a session instruction entry,
+`team.protocol`, which OpenCode renders as a `<context key="team.protocol">`
+block. It says:
+
+- a user turn starting `[agent-message from ses_…]` is a durable message from
+  another AI agent session, **not** the human user; act on it at the next
+  natural boundary;
+- reply with `team_send` (to the sender's ID, also carried in the message
+  metadata as `from`) only when the sender needs an answer or a decision —
+  never just to acknowledge;
+- progress goes in `mode: "note"`; message the parent only for a blocker or a
+  finding that changes others' work (a subagent's final answer already reaches
+  its parent);
+- change a running agent's orders with `team_send`, not a second subagent call
+  on the same session.
+
+An instruction entry rather than a system part, because providers that drop
+OpenCode's system prompt — such as the Claude Code bridge
+(`@openchamber/opencode-claude`) — still forward `<context key=…>` blocks.
+The plugin puts the entry from its `context` hook the first time it sees a
+session. A session's instruction baseline is fixed at its first step, so the
+entry reaches the model as a `<system-update>` from the next step on; the
+first step gets the same text as a system part. On a host without instruction
+entries the hook falls back to a system part on every call.
 
 There is no polling loop: an agent that wants replies reads its own history
 with `team_query` `read`, optionally after `team_query` `wait`. Pending

@@ -4,9 +4,11 @@
 // they cost ~zero context there):
 //
 //   team_send   deliver a message to another session — a ses_… ID, 'parent',
-//               'siblings', or 'children' — queued by default, with steer /
-//               interrupt / park delivery modes.
-//   team_query  inbox | list | read | status | wait over other sessions.
+//               'siblings', or 'children' — steered by default, with queue /
+//               interrupt / park delivery modes, or store a progress note for
+//               the parent ('note') that wakes no one.
+//   team_query  inbox | list | read | status | wait over other sessions;
+//               list/status rows carry each session's latest progress note.
 //
 // Scoping policy is enforced HERE, not by the server: the HTTP API will
 // happily message or read any session by ID. This plugin refuses
@@ -17,6 +19,10 @@
 // event stream is deliberately unused (volatile: missed on disconnect).
 // There is no polling loop — agents that want replies read their own history
 // via `team_query read`, optionally after `team_query wait`.
+//
+// The protocol reaches each model as a session instruction entry rather than
+// only a context-hook system part: providers that drop OpenCode's system
+// prompt (e.g. the Claude Code bridge) still forward `<context key=…>` entries.
 import { Plugin } from "@opencode/plugin"
 import {
   OpenCode,
@@ -31,10 +37,38 @@ const MAX_TEXT = 500
 const DEFAULT_LIMIT = 20
 // `wait` bounds: the wait API has no timeout parameter of its own.
 const DEFAULT_WAIT_S = 300
+// Progress notes: one per child, keyed under its parent so one prefix scan
+// reads a whole family. Throttled so a chatty child cannot write every step.
+const NOTE_PREFIX = "note/"
+const NOTE_MIN_INTERVAL_MS = 10_000
+// Session instruction entry carrying the protocol (key: ^[a-z0-9][a-z0-9._-]*$).
+const PROTOCOL_KEY = "team.protocol"
+
+type Mode = "queue" | "steer" | "interrupt" | "park" | "note"
+type Note = { text: string; at: number }
 
 function truncate(text: string, max = MAX_TEXT): string {
   const flat = text.replace(/\s+/g, " ").trim()
   return flat.length > max ? `${flat.slice(0, max)}…` : flat
+}
+
+const noteKey = (parentID: string, sessionID: string) => `${NOTE_PREFIX}${parentID}/${sessionID}`
+
+function isNote(value: unknown): value is Note {
+  const note = value as Note | undefined
+  return typeof note?.text === "string" && typeof note.at === "number"
+}
+
+/** The agent-to-agent protocol, as each session's instruction entry renders it. */
+function protocol(sessionID: string): string {
+  return [
+    `Agent-to-agent messaging (team plugin) is active; your session ID is ${sessionID}.`,
+    `Its tools are team_send and team_query; in Code Mode they are called inside the \`execute\` tool as \`await tools.team.send({ to, text, mode })\` and \`await tools.team.query({ action, sessionID })\`.`,
+    `A user turn starting "[agent-message from ses_…]" comes from another AI agent session, not the human user. Act on it at your next natural boundary.`,
+    `Reply with team_send only when the sender needs an answer or a decision; never send acknowledgements ("received", "ok", "will do").`,
+    `Progress goes in team_send mode "note": it wakes no one, and your parent sees it with team_query status/list. Message your parent only for a blocker or a finding that changes others' work; if you run as a subagent, your final answer already reaches your parent when you finish.`,
+    `To change the orders of an agent that is already running, use team_send; do not start a second subagent call on the same session.`,
+  ].join("\n")
 }
 
 /**
@@ -139,6 +173,31 @@ export default Plugin.define({
       return target
     }
 
+    // Latest progress note of every child of the given parents, keyed by
+    // child ID: one prefix scan per parent. Unreadable storage degrades to
+    // "no notes" rather than failing the query.
+    const notesOf = async (parentIDs: Iterable<string>) => {
+      const notes = new Map<string, Note>()
+      for (const parentID of new Set(parentIDs)) {
+        const prefix = `${NOTE_PREFIX}${parentID}/`
+        try {
+          let after: string | undefined
+          do {
+            const page = await ctx.storage.scan({ prefix, ...(after ? { after } : {}) })
+            for (const entry of page.entries) {
+              if (isNote(entry.value)) notes.set(entry.key.slice(prefix.length), entry.value)
+            }
+            after = page.next
+          } while (after)
+        } catch {
+          // fall through with whatever was read
+        }
+      }
+      return notes
+    }
+    const noteFields = (note: Note | undefined) =>
+      note ? { note: note.text, noteAge: Math.round((Date.now() - note.at) / 1000) } : { note: null }
+
     await ctx.tool.transform((editor) => {
       editor.namespace({
         name: "team",
@@ -151,10 +210,12 @@ export default Plugin.define({
         description:
           "Send a message to another agent session in this project. " +
           "The message is delivered to the target model as durable input. " +
-          "`mode` selects how: 'queue' (default) delivers after the target finishes its current turn (waking idle sessions); " +
-          "'steer' injects at the target's next model call without stopping execution; " +
+          "`mode` selects how: 'steer' (default) injects at the target's next model call without stopping execution, waking idle sessions; " +
+          "'queue' waits until the target finishes its current turn; " +
           "'interrupt' aborts the target's current execution entirely, then delivers and starts a fresh run; " +
-          "'park' admits durably without waking the target (delivered on its next run; for context-only messages, not action items).",
+          "'park' admits durably without waking the target (delivered on its next run; for context-only messages, not action items); " +
+          "'note' delivers nothing: it stores your latest progress note for your parent (to: 'parent' only), " +
+          "shown in its team_query status/list and waking no one (at most one note every 10 s).",
         input: {
           type: "object",
           properties: {
@@ -166,16 +227,17 @@ export default Plugin.define({
             text: { type: "string", description: "Message for the receiving model." },
             mode: {
               type: "string",
-              enum: ["queue", "steer", "interrupt", "park"],
+              enum: ["steer", "queue", "interrupt", "park", "note"],
               description:
-                "Delivery mode. 'queue' (default): after the target's current turn ends, waking idle sessions — " +
-                "use for anything the target should act on next. " +
-                "'steer': at the target's next model call, without stopping execution — " +
-                "use for mid-run course corrections that shouldn't discard in-flight work. " +
+                "Delivery mode. 'steer' (default): at the target's next model call, without stopping execution, " +
+                "waking idle sessions; several pending steers arrive together — use for anything the target should act on. " +
+                "'queue': only after the target's current turn ends — use when the message must not reach it mid-turn. " +
                 "'interrupt': abort the target's run first; the message starts a fresh run — " +
                 "use when its current work is wrong or obsolete ('stop what you're doing'). " +
                 "'park': admit durably but do not wake the target; delivered only if it runs again later — " +
-                "use for FYI context, findings, or notes it should see IF it resumes, never for action items.",
+                "use for FYI context, findings, or notes it should see IF it resumes, never for action items. " +
+                "'note': store a one-line progress note for your parent instead of messaging it (to: 'parent'); " +
+                "it replaces your previous note and wakes no one.",
             },
           },
           required: ["to", "text"],
@@ -183,16 +245,28 @@ export default Plugin.define({
         },
         options: { namespace: "team", permission: "team_send", codemode: true },
         execute: async (raw, context) => {
-          const { to, text, mode } = raw as {
-            to: string
-            text: string
-            mode?: "queue" | "steer" | "interrupt" | "park"
-          }
+          const { to, text, mode = "steer" } = raw as { to: string; text: string; mode?: Mode }
           if (to === context.sessionID) {
             throw new Error("team send: refuses your own session; just reply in turn")
           }
 
           const self = await ctx.session.get({ sessionID: context.sessionID })
+
+          if (mode === "note") {
+            // A note is stored, never delivered: the parent reads it through
+            // team_query, so nobody is woken.
+            if (to !== "parent") throw new Error("team send: mode 'note' only goes to 'parent'")
+            if (!self.parentID) throw new Error("team send: this session has no parent")
+            const key = noteKey(self.parentID, context.sessionID)
+            const previous = await ctx.storage.get(key)
+            const now = Date.now()
+            if (isNote(previous) && now - previous.at < NOTE_MIN_INTERVAL_MS) {
+              const wait = Math.ceil((NOTE_MIN_INTERVAL_MS - (now - previous.at)) / 1000)
+              return { content: `note not saved: last note was under 10 s ago; retry in ${wait} s or keep working` }
+            }
+            await ctx.storage.set(key, { text: truncate(text), at: now })
+            return { content: "note saved for parent (no one woken)" }
+          }
           // Role addressing: a child always knows its parent; siblings share
           // that parent. Raw ses_… IDs pass through unchanged. 'children' is
           // the parent broadcast. Resolved targets still pass the project
@@ -255,7 +329,7 @@ export default Plugin.define({
             steer: "steer",
             interrupt: "interrupted+queued",
             park: "parked",
-          }[mode ?? "queue"]
+          }[mode]
           return { content: `delivered (${label}) to: ${delivered.join(", ") || "(no targets)"}` }
         },
       })
@@ -266,9 +340,9 @@ export default Plugin.define({
         description:
           "Inspect, search, and monitor sibling/child sessions. Actions: " +
           "inbox (list a session's pending inbox items; `inboxID` cancels one, 'all' cancels every pending item), " +
-          "list (find sessions; children by default, `parent` for siblings, `search` filters by title), " +
+          "list (find sessions; children by default, `parent` for siblings, `search` filters by title; rows carry each session's latest progress `note`), " +
           "read (tail a session's messages, `cursor` pages further back and the response returns `next`), " +
-          "status (whether a session is running or blocked on a permission ask or form; omit sessionID for all running in the scoped project), " +
+          "status (whether a session is running or blocked on a permission ask or form, plus its latest progress `note` and `noteAge` in seconds; omit sessionID for all running in the scoped project), " +
           "wait (block until the given session goes idle, bounded by `timeout` seconds).",
         input: {
           type: "object",
@@ -385,6 +459,7 @@ export default Plugin.define({
             })
             const running = await client.session.active()
             const blocked = await blockedMap(client)
+            const notes = await notesOf(data.flatMap((session) => (session.parentID ? [session.parentID] : [])))
             const rows = data.map((session) => ({
               id: session.id,
               title: session.title,
@@ -393,6 +468,7 @@ export default Plugin.define({
               running: session.id in running,
               blocked: blocked.get(session.id) ?? null,
               updated: session.time.updated,
+              ...noteFields(notes.get(session.id)),
             }))
             return { content: JSON.stringify(rows) }
           }
@@ -448,7 +524,11 @@ export default Plugin.define({
           // status
           if (input.sessionID) {
             const target = await scopedSession("status", input.sessionID, input.project ?? projectID)
-            const [running, blocked] = await Promise.all([client.session.active(), blockedMap(client)])
+            const [running, blocked, notes] = await Promise.all([
+              client.session.active(),
+              blockedMap(client),
+              notesOf(target.parentID ? [target.parentID] : []),
+            ])
             return {
               content: JSON.stringify({
                 id: target.id,
@@ -456,6 +536,7 @@ export default Plugin.define({
                 agent: target.agent,
                 running: input.sessionID in running,
                 blocked: blocked.get(target.id) ?? null,
+                ...noteFields(notes.get(target.id)),
               }),
             }
           }
@@ -464,32 +545,54 @@ export default Plugin.define({
             limit: 100,
           })
           const [running, blocked] = await Promise.all([client.session.active(), blockedMap(client)])
-          const rows = data
-            .filter((session) => session.id in running)
-            .map((session) => ({
-              id: session.id,
-              title: session.title,
-              agent: session.agent,
-              blocked: blocked.get(session.id) ?? null,
-            }))
+          const active = data.filter((session) => session.id in running)
+          const notes = await notesOf(active.flatMap((session) => (session.parentID ? [session.parentID] : [])))
+          const rows = active.map((session) => ({
+            id: session.id,
+            title: session.title,
+            agent: session.agent,
+            blocked: blocked.get(session.id) ?? null,
+            ...noteFields(notes.get(session.id)),
+          }))
           return { content: JSON.stringify(rows) }
         },
       })
     })
 
-    // Agent-to-agent protocol, injected system-side on every agent-loop model
-    // call. Synthetic messages reach the model as plain user turns (the wire
-    // format requires a user-role final message and carries no marker), so
-    // this line plus the in-text "[agent-message from …]" frame added at send
-    // time are what tells agents the message is not from the human.
-    await ctx.session.hook("context", (event) => {
-      event.system.push({
-        type: "text",
-        text:
-          `Agent-to-agent messaging is active (team plugin). Your session ID is ${event.sessionID}. ` +
-          `A user turn starting "[agent-message from ses_…]" is a durable message from another AI agent session, not the human user. ` +
-          `Treat the sender as a coordinating peer: honor its requests at natural boundaries and, if needed, reply with team_send (to: the sender's ID).`,
-      })
+    // Agent-to-agent protocol. Synthetic messages reach the model as plain
+    // user turns (the wire format requires a user-role final message and
+    // carries no marker), so this text plus the in-text
+    // "[agent-message from …]" frame added at send time are what tell agents
+    // the message is not from the human.
+    //
+    // It lives in a session instruction entry, rendered `<context key=…>`:
+    // providers that drop OpenCode's system prompt (the Claude Code bridge)
+    // still forward those. The baseline holding entries is fixed at a
+    // session's first step, so an entry put from here first shows up as a
+    // `<system-update>` at the next step; this step gets a system part
+    // instead. Sessions settled here are remembered for the process lifetime.
+    const protocolReady = new Set<string>()
+    await ctx.session.hook("context", async (event) => {
+      const sessionID = event.sessionID
+      if (protocolReady.has(sessionID)) return
+      const text = protocol(sessionID)
+      if (event.system.some((part) => part.text.includes(`<context key="${PROTOCOL_KEY}">`))) {
+        protocolReady.add(sessionID)
+        return
+      }
+      try {
+        const entries = await ctx.session.instructions.entry.list({ sessionID })
+        // Already put (e.g. before a restart) and announced since: nothing to add.
+        if (!entries.some((entry) => entry.key === PROTOCOL_KEY && entry.value === text)) {
+          await ctx.session.instructions.entry.put({ sessionID, key: PROTOCOL_KEY, value: text })
+          event.system.push({ type: "text", text })
+        }
+        protocolReady.add(sessionID)
+      } catch {
+        // No instruction entries on this host: fall back to a system part on
+        // every call, as before.
+        event.system.push({ type: "text", text })
+      }
     })
   },
 })
